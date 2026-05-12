@@ -5,7 +5,7 @@
 
 ## TL;DR
 
-This document consolidates the DeepSeek V4 decode work that moved fixed long decode from the `~108-113ms/token` band to the current shared-expert fused branch at `28.16-32.22ms/token`, with routed W13+SwiGLU-quant validation at `31.18-33.42ms/token`, W13-only validation at `31.99-34.22ms/token`, and shared-quant-only validation at `33.33-34.29ms/token`. The retained changes are grouped MoE pointer caching, rank-worker placement, removal of hot temporary zero-fill, rank-owned decode scratch, caller-owned grouped FP4 workspace, shared W1/W3 activation quantization, W13 grouped FP4 runtime launch, routed fused SwiGLU+W2 activation quantization, shared expert fused W1/W3 quant, shared fused SwiGLU+W2 quant, shared dense FP8 W13, and benchmark/counter instrumentation. The active MoE goal is stable sub-`30ms/token` decode first, then sub-`25ms/token`, by mirroring mature vLLM/SGLang decode MoE decomposition and only then exploring deeper fusion without bs=1 specialization. Exact E2E remains `20/20`, and the fixed bench token hash remains `6346f03343d75a65`.
+This document consolidates the DeepSeek V4 decode work that moved fixed long decode from the `~108-113ms/token` band to the current shared-expert fused branch at about `29.90-29.94ms/token` on the latest clean fixed bench, with earlier shared-expert fused repeats at `28.16-32.22ms/token`, routed W13+SwiGLU-quant validation at `31.18-33.42ms/token`, W13-only validation at `31.99-34.22ms/token`, and shared-quant-only validation at `33.33-34.29ms/token`. The retained changes are grouped MoE pointer caching, rank-worker placement, removal of hot temporary zero-fill, rank-owned decode scratch, caller-owned grouped FP4 workspace, shared W1/W3 activation quantization, W13 grouped FP4 runtime launch, routed fused SwiGLU+W2 activation quantization, shared expert fused W1/W3 quant, shared fused SwiGLU+W2 quant, shared dense FP8 W13, and benchmark/counter instrumentation. The active MoE goal is stable sub-`30ms/token` decode first, then sub-`25ms/token`, by mirroring mature vLLM/SGLang decode MoE decomposition and only then exploring deeper fusion without bs=1 specialization. Exact E2E remains `20/20`, and the fixed bench token hash remains `6346f03343d75a65`.
 
 The retained team lessons are more important than the discarded attempt logs: compare identical token traces, separate NCCL wait from transfer, treat capacity and logical length separately, keep MoE semantic zero on device, and prove allocation cleanup with application-visible CUDA API counters rather than nsys attribution alone.
 
@@ -37,6 +37,7 @@ target/release/bench_serving \
 | W13 grouped runtime launch | text `34.22ms`, JSON `31.986ms` | W1 and W3 share one TileLang grouped FP4 launch after shared activation quant; token hash stays `6346f03343d75a65`, exact E2E `20/20`. |
 | Routed fused SwiGLU + W2 act quant | `33.416ms`, repeated `31.180ms` | Mirror vLLM/SGLang's activation+quant fusion after materialized W13 output; token hash stays `6346f03343d75a65`, exact E2E `20/20`. |
 | Shared expert fused quant + dense W13 | `29.764ms`, repeated `31.592ms` | Shared expert scratch path reuses one FP8 act quant for W1/W3, fuses shared SwiGLU+W2 act quant, and uses one dense FP8 W13 launch; token hash stays `6346f03343d75a65`, exact E2E `20/20`. |
+| Clean sub-30 repeat after trace cleanup | `29.944ms`, `29.907ms`, `29.896ms` | Same fixed bench after removing per-layer trace syncs; all three measured iterations keep token hash `6346f03343d75a65`. |
 
 Final PR validation on 5090:
 
@@ -278,7 +279,9 @@ Reference source positions:
 | SGLang | `/data/code/workspace-rustllm/sglang/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py` | `grouped_gemm_nt_f8f8bf16_masked` writes `gateup_output`, then `sglang_per_token_group_quant_8bit(..., fuse_silu_and_mul=True)`, then W2 grouped GEMM. |
 | SGLang C++ quant | `/data/code/workspace-rustllm/sglang/sgl-kernel/csrc/gemm/per_token_group_quant_8bit_v2.cu` | The `fuse_silu_and_mul` path fuses activation with group quant, including masked expert layout. |
 
-The next reusable lesson is their problem-size representation. vLLM builds `expert_offsets`, `blockscale_offsets`, `problem_sizes1`, and `problem_sizes2` before CUTLASS grouped GEMM. SGLang's masked path passes `masked_m` and `expected_m` into DeepGEMM. Both make the GEMM scheduler aware of per-expert logical M. PegaInfer currently has `expert_indptr`, but the TileLang grouped launch still uses `dim3 grid(out_tiles, ceil(rows / 32), local_experts)` and returns inside the kernel when `blockIdx.y * 32 >= expert_m`. That is correct and GPU-resident, but it still launches empty CTAs for short or empty experts. The next MoE copy target is therefore not another activation fusion; it is an active problem/tile list that keeps route metadata on GPU while avoiding the current capacity-style overlaunch.
+The next reusable lesson is their problem-size representation. vLLM builds `expert_offsets`, `blockscale_offsets`, `problem_sizes1`, and `problem_sizes2` before CUTLASS grouped GEMM. SGLang's masked path passes `masked_m` and `expected_m` into DeepGEMM. Both make the GEMM scheduler aware of per-expert logical M. PegaInfer currently has `expert_indptr`, but the TileLang grouped launch still uses `dim3 grid(out_tiles, ceil(rows / 32), local_experts)` and returns inside the kernel when `blockIdx.y * 32 >= expert_m`. That is correct and GPU-resident, but it still launches empty CTAs for short or empty experts.
+
+The first active-tile design check found a launch-side constraint: a GPU-generated active tile list cannot by itself shrink the next CUDA launch because grid dimensions are chosen on the host. Using a device-side `active_tile_count` would require a D2H count, CUDA dynamic parallelism, or launching the original capacity grid and returning on `tile >= active_count`. The last option preserves correctness but not the desired launch reduction. A better target is the existing `local_count`: decode route mapping already computes the actual number of local routes on GPU, while runtime still carries `num_expanded = routed.seq_len * topk` (`8 * 6 = 48` for MP8 decode) through expand, activation quant, and grouped GEMM. The hard part is exploiting `local_count` without reintroducing route metadata D2H.
 
 Current PegaInfer path after W13:
 
@@ -381,6 +384,8 @@ Implementation notes:
 | fixed bench JSON run 1 | steady TPOT avg `29.764ms`, p50 `29.296ms`, p95 `31.766ms`, first decode avg `28.575ms`, hash `6346f03343d75a65` |
 | fixed bench JSON run 2 | steady TPOT avg `31.592ms`, p50 `31.082ms`, p95 `33.699ms`, first decode avg `30.019ms`, hash `6346f03343d75a65` |
 | additional fixed repeats | `32.220ms`, `30.061ms`, `28.159ms`, all hash `6346f03343d75a65` |
+| clean fixed bench after trace removal | `29.944ms`, `29.907ms`, `29.896ms`, all hash `6346f03343d75a65` |
+| current HEAD exact E2E after clean bench | `All 20 DeepSeek V4 exact cases passed` |
 
 Short nsys composition evidence, collected with `--output-len 32 --warmup 1 --iters 1 --seed 42` and used only for kernel composition, not TPOT:
 
@@ -511,6 +516,8 @@ Local:
 - `cargo check --release -p pegainfer-server --features deepseek-v4`
 - release `deepseek_v4_e2e`: `All 20 DeepSeek V4 exact cases passed`
 - release fixed bench log `/tmp/dsv4_pr_driver_numa_bench.log`: steady TPOT avg `35.253ms`, p50 `34.800ms`, p95 `37.335ms`, first decode avg `33.743ms`, hash `6346f03343d75a65`
+- current clean fixed bench log `/tmp/dsv4_clean_tpot_now.log`: per-iteration steady TPOT avg `29.944ms`, `29.907ms`, `29.896ms`, all hash `6346f03343d75a65`
+- current exact E2E log `/tmp/dsv4_e2e_current.log`: `All 20 DeepSeek V4 exact cases passed`
 - `gcc -shared -fPIC -O2 -Wall -Wextra -o /tmp/cuda_api_counter.so tools/cuda_api_counter.c -ldl`
 - `nm -D /tmp/cuda_api_counter.so` confirmed base and `_ptsz` wrappers
 
