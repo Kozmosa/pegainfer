@@ -8,7 +8,8 @@ mod weights;
 pub use config::{Config, RopeScaling, TensorParallelConfig};
 pub use direct::{
     DeepSeekV4DirectGenerator, DeepSeekV4RequestState, DirectDecodeStep, DirectGeneration,
-    start_engine,
+    DirectKvCacheActiveSnapshot, DirectKvCacheLease, DirectKvCacheReject,
+    DirectKvCacheRejectReason, DirectKvCacheSnapshot, start_engine,
 };
 pub use model::{
     AttentionWeightNames, AttentionWeights, BlockWeightNames, BlockWeights, CompressorWeightNames,

@@ -4,5 +4,6 @@ mod worker;
 
 pub use scheduler::{
     DeepSeekV4DirectGenerator, DeepSeekV4RequestState, DirectDecodeStep, DirectGeneration,
-    start_engine,
+    DirectKvCacheActiveSnapshot, DirectKvCacheLease, DirectKvCacheReject,
+    DirectKvCacheRejectReason, DirectKvCacheSnapshot, start_engine,
 };
