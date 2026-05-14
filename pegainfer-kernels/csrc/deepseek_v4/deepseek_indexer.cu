@@ -642,7 +642,7 @@ cudaError_t deepseek_indexer_scores_decode_cuda(
     float score_scale,
     cudaStream_t stream) {
   if (q == nullptr || kv == nullptr || weights == nullptr || scores == nullptr ||
-      local_heads <= 0 || head_dim != 128 || compressed_len <= 0) {
+      local_heads <= 0 || head_dim <= 0 || compressed_len <= 0) {
     return cudaErrorInvalidValue;
   }
 

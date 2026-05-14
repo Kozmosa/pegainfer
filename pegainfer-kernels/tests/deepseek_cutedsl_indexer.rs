@@ -1,4 +1,4 @@
-#![cfg(feature = "deepseek-v4")]
+#![cfg(feature = "deepseek-v4-cutedsl-diagnostic")]
 
 use std::ffi::c_void;
 use std::mem::size_of;

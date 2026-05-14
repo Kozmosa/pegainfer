@@ -1002,12 +1002,13 @@ fn main() {
     let sm_targets = detect_sm_targets();
     let arch_args = nvcc_arch_args(&sm_targets);
     let deepseek_enabled = cfg!(feature = "deepseek-v4");
+    let cutedsl_diagnostic_enabled = cfg!(feature = "deepseek-v4-cutedsl-diagnostic");
     let tilelang_artifacts = if deepseek_enabled {
         Some(generate_deepseek_tilelang_artifacts(&out_dir))
     } else {
         None
     };
-    let cutedsl_artifacts = if deepseek_enabled {
+    let cutedsl_artifacts = if cutedsl_diagnostic_enabled {
         Some(generate_deepseek_cutedsl_artifacts(&out_dir))
     } else {
         None
