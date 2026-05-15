@@ -427,6 +427,56 @@ Direct `bench_serving` under `nsys` for the 10k prompt reports TTFT
 `6542.36ms` and generated-token hash `39a863e299d2b187`. These are attribution
 observations for this workload, not production throughput claims.
 
+### P6 Overlap Compressor Route Unroll
+
+After P5, the remaining largest captured family in the 10k prefill profile is
+the ratio-4 overlap compressor. This step keeps the existing overlap compressor
+kernel shape and only asks the compiler to unroll its fixed 8-route loops in
+`deepseek_compressor_overlap_weighted_kernel`. It does not change cache reuse,
+cross-layer reuse, scheduler behavior, HTTP behavior, the normalizer kernel, or
+decode compressor paths.
+
+The ignored GPU equivalence gate exercises the prefill overlap compressor core
+directly through `deepseek_compressor_overlap_prefill_cuda`. It covers both
+ratio-4 call sites used by the prefill runtime:
+
+- indexer overlap compressor shape, represented by `head_dim=128`;
+- main overlap compressor shape, represented by `head_dim=512`;
+- small sanity shapes, an odd boundary shape, and the 10k launch shape
+  `seq_len=10580`.
+
+The tested kernel consumes hidden states, compressor weights, gate weights,
+absolute positional embeddings, and the RMS norm vector; it produces the
+weighted compressed buffer and normalized compressed BF16 output. Current
+ratio-4 prefill callers only support `start_pos=0`; RoPE is applied by the
+runtime after this prefill compressor call, and decode tail/overlap state is
+handled by the separate decode compressor path. This change therefore does not
+alter `start_pos`, RoPE, or tail-state semantics.
+
+Validation at this PR head:
+
+| Gate | Result |
+| --- | --- |
+| default `deepseek-v4` server/bench build | passed |
+| overlap compressor ignored GPU gate | 3 passed / 0 failed |
+| direct decode hash | `6346f03343d75a65` across 3 measured iterations |
+| 10k direct generated-token hash | `39a863e299d2b187` |
+| HTTP c1/c2/c4/c8 repeated hash | failed `0`, timeout `0`, per-request hashes stable; combined hash `22706877075acde0` |
+
+The 10k `nsys` observation:
+
+| Kernel family | P5 default total ms / calls | P6 route-unroll total ms / calls | Observation |
+| --- | ---: | ---: | --- |
+| overlap compressor | `20785.88 / 504` | `20574.75 / 504` | small, about 1% lower in this capture |
+| indexer score | `1815.95 / 168` | `1814.80 / 168` | unchanged |
+| indexer top-k | `1196.05 / 168` | `1195.57 / 168` | unchanged |
+| indexed attention | `731.40 / 344` | `730.98 / 344` | unchanged |
+
+Direct `bench_serving` under `nsys` for the 10k prompt reports TTFT
+`6513.94ms` and generated-token hash `39a863e299d2b187`. This is a small
+workload-specific attribution observation, not a generalized serving throughput
+or production performance claim.
+
 ## Boundary
 
 This PR establishes a benchmark gate and one real HTTP run. It does not claim

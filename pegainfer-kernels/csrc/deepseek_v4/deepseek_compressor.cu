@@ -334,6 +334,7 @@ __global__ void deepseek_compressor_overlap_weighted_kernel(
   float *scores = scratch + 2 * blockDim.x;
   float *values = scores + routes;
 
+#pragma unroll
   for (int route = 0; route < routes; ++route) {
     bool valid = true;
     int token = 0;
@@ -381,11 +382,13 @@ __global__ void deepseek_compressor_overlap_weighted_kernel(
 
   if (tid == 0) {
     float max_score = -3.4028234663852886e38f;
+#pragma unroll
     for (int route = 0; route < routes; ++route) {
       max_score = fmaxf(max_score, scores[route]);
     }
     float denom = 0.0f;
     float acc = 0.0f;
+#pragma unroll
     for (int route = 0; route < routes; ++route) {
       float prob = expf(scores[route] - max_score);
       denom += prob;
