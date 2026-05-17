@@ -168,21 +168,23 @@ __global__ void deepseek_compressor_norm_serial_kernel(
   out[compressed * head_dim + dim] = __float2bfloat16(value);
 }
 
-// Fused overlap-compressor prefill epilogue. Consumes per-token (score, value)
-// FP32 tensors produced by two upstream X @ W^T BF16->FP32 cuBLAS GEMMs (gate
-// scores, kv values), and for each compressed row:
-//   1) gathers the 8 ratio-4 overlap routes per (compressed, dim) cell,
+// Fused non-overlap-compressor prefill epilogue. Consumes per-token
+// (score, value) FP32 tensors produced by two upstream X @ W^T BF16->FP32
+// cuBLAS GEMMs (gate scores, kv values), and for each compressed row:
+//   1) streams over the `ratio` non-overlap routes per (compressed, dim) cell
+//      with online softmax (two passes per dim: max, then denom + weighted
+//      sum together) so `ratio` is unbounded,
 //   2) adds the per-route APE bias and runs numerically-stable softmax,
 //   3) writes the FP32 weighted output,
 //   4) reduces the row's sum-of-squares to inv_rms and emits the BF16 RMSNormed
 //      output -- all in one launch, without round-tripping `weighted` through
 //      HBM between softmax and RMSNorm.
 //
-// scores_in / values_in are row-major (seq_len, 2*head_dim) FP32 tensors emitted
+// scores_in / values_in are row-major (seq_len, head_dim) FP32 tensors emitted
 // by cuBLAS via the swap-and-transpose trick used in deepseek_bf16_linear_cuda:
 // cuBLAS sees A=W with OP_T and B=X with OP_N, so its column-major (n, seq_len)
 // result is bit-equal to the row-major (seq_len, n) buffer we read here.
-// sv_n_stride is the M-row stride, equal to 2 * head_dim.
+// sv_n_stride is the M-row stride, equal to head_dim.
 //
 // Launch: 1 block per compressed position, blockDim.x covers head_dim with a
 // strided loop. Block must be a multiple of warpSize and at most 1024 threads.
@@ -712,12 +714,11 @@ cudaError_t deepseek_bf16_linear_cuda(
 // (X @ Wgate^T for scores, X @ Wkv^T for values) into a shared FP32 scratch,
 // then one fused epilogue kernel that gathers the `ratio` routes per
 // compressed token, softmaxes, writes `weighted`, and RMSNorms in place to
-// BF16 `out`. Mirrors `deepseek_compressor_overlap_prefill_cuda` (task #46
-// follow-up: PR #140 family applied to the non-overlap path, replacing the
-// previous hand-rolled `_weighted_kernel` which redundantly reloaded weights
-// per `(compressed, head_dim)` output element). The single scratch alloc
-// (covering both score + value buffers) avoids paying cudaMallocAsync overhead
-// twice.
+// BF16 `out`. Mirrors the structure of `deepseek_compressor_overlap_prefill_cuda`.
+// Replaces the previous hand-rolled per-(compressed, head_dim) weighted kernel,
+// which redundantly reloaded `Wgate` / `Wkv` for every output element and
+// never reached tensor cores. The single scratch alloc covering both score
+// and value buffers avoids paying `cudaMallocAsync` overhead twice.
 cudaError_t deepseek_compressor_nonoverlap_prefill_cuda(
     const __nv_bfloat16 *x,
     const __nv_bfloat16 *wkv,
