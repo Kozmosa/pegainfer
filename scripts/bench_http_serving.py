@@ -152,6 +152,26 @@ def parse_sse_text(payload: dict[str, Any]) -> str:
     return delta.get("content") or ""
 
 
+def parse_sse_finish_reason(payload: dict[str, Any]) -> str | None:
+    choices = payload.get("choices") or []
+    if not choices:
+        return None
+    finish_reason = choices[0].get("finish_reason")
+    return finish_reason if isinstance(finish_reason, str) else None
+
+
+def parse_sse_error(payload: dict[str, Any]) -> str | None:
+    error = payload.get("error")
+    if isinstance(error, str):
+        return error
+    if isinstance(error, dict):
+        message = error.get("message")
+        if isinstance(message, str):
+            return message
+        return json.dumps(error, sort_keys=True)
+    return None
+
+
 def request_once(
     index: int,
     request_id: str,
@@ -210,6 +230,12 @@ def request_once(
             if data == "[DONE]":
                 break
             payload = json.loads(data)
+            stream_error = parse_sse_error(payload)
+            if stream_error is not None:
+                raise RuntimeError(f"SSE error: {stream_error}")
+            finish_reason = parse_sse_finish_reason(payload)
+            if finish_reason == "error":
+                raise RuntimeError("SSE finish_reason=error")
             text = parse_sse_text(payload)
             if not text:
                 continue
@@ -327,6 +353,7 @@ def failed_result(
 
 
 TRACE_RE = re.compile(r"pegainfer_http_trace\s+(\{.*\})")
+STREAM_ERROR_RE = re.compile(r'request failed .*self\.request_id="([^"]+)"')
 
 
 def load_server_traces(path: Path | None) -> dict[str, dict[str, Any]]:
@@ -334,6 +361,11 @@ def load_server_traces(path: Path | None) -> dict[str, dict[str, Any]]:
         return {}
     traces: dict[str, dict[str, Any]] = {}
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stream_error_match = STREAM_ERROR_RE.search(line)
+        if stream_error_match:
+            request_id = stream_error_match.group(1)
+            traces.setdefault(request_id, {"request_id": request_id})["server_error"] = line.strip()
+            continue
         match = TRACE_RE.search(line)
         if not match:
             continue
@@ -363,6 +395,26 @@ def attach_server_traces(results: list[RequestResult], traces: dict[str, dict[st
             scheduled_at = trace.get("scheduled_at_unix_s")
             if isinstance(queued_at, (int, float)) and isinstance(scheduled_at, (int, float)):
                 trace["admission_queue_ms"] = max(0.0, (float(scheduled_at) - float(queued_at)) * 1000.0)
+        apply_server_error_gate(result)
+
+
+def apply_server_error_gate(result: RequestResult) -> None:
+    if not result.ok or result.server_trace is None:
+        return
+    server_error = result.server_trace.get("server_error")
+    if isinstance(server_error, str):
+        result.ok = False
+        result.error = f"server generation error: {server_error}"
+        return
+    finish_reason = result.server_trace.get("finish_reason")
+    if finish_reason == "error":
+        result.ok = False
+        result.error = "server generation error: finish_reason=error"
+        return
+    completion_tokens = result.server_trace.get("completion_tokens")
+    if result.max_tokens > 0 and completion_tokens == 0:
+        result.ok = False
+        result.error = "server generation error: completion_tokens=0"
 
 
 def find_server_trace(
