@@ -141,15 +141,49 @@ fn parse_sm_token(raw: &str) -> Option<String> {
     None
 }
 
-fn normalize_flashinfer_sm(sm: &str) -> String {
-    match sm {
-        // FlashInfer normalizes RTX 50 / SM120 to the family-specific `f`
-        // target when CUDA >= 12.9. Plain sm_120 builds compile but trip
-        // CUTLASS conditional MMA runtime asserts in SM120 groupwise GEMM.
-        "120" => "120f".to_string(),
-        "121" => "121a".to_string(),
-        _ => sm.to_string(),
+fn nvcc_supported_arches(nvcc: &str) -> Option<BTreeSet<String>> {
+    let output = Command::new(nvcc).arg("--list-gpu-arch").output().ok()?;
+    if !output.status.success() {
+        return None;
     }
+
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("compute_"))
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+fn normalize_nvcc_sm(sm: &str, supported_arches: Option<&BTreeSet<String>>) -> String {
+    let preferred = match sm {
+        "120" | "120f" => Some("120f"),
+        "121" | "121a" => Some("121a"),
+        _ => None,
+    };
+    if let Some(preferred) = preferred {
+        if supported_arches.is_some_and(|arches| arches.contains(&format!("compute_{preferred}"))) {
+            return preferred.to_string();
+        }
+        let raw = sm_numeric_prefix(sm)
+            .map(|sm| sm.to_string())
+            .unwrap_or_else(|| sm.to_string());
+        println!(
+            "cargo:warning=nvcc does not list compute_{preferred}; compiling CUDA kernels for raw sm_{raw}"
+        );
+        return raw;
+    }
+    sm.to_string()
+}
+
+fn normalize_nvcc_sms(sm_targets: &[String], nvcc: &str) -> Vec<String> {
+    let supported_arches = nvcc_supported_arches(nvcc);
+    sm_targets
+        .iter()
+        .map(|sm| normalize_nvcc_sm(sm, supported_arches.as_ref()))
+        .collect()
 }
 
 fn sm_targets_from_nvidia_smi() -> Option<Vec<String>> {
@@ -209,24 +243,16 @@ fn detect_sm_targets() -> Vec<String> {
     panic!("GPU detection failed");
 }
 
-fn nvcc_arch_args(sm_targets: &[String]) -> Vec<String> {
+fn nvcc_arch_args(normalized_sms: &[String]) -> Vec<String> {
     let mut args = Vec::new();
-    for sm in sm_targets {
-        let sm = normalize_flashinfer_sm(sm);
+    for sm in normalized_sms {
         args.push("-gencode".to_string());
         args.push(format!("arch=compute_{sm},code=sm_{sm}"));
     }
 
-    if let Some(max_sm) = sm_targets
+    if let Some(max_sm) = normalized_sms
         .iter()
-        .map(|sm| normalize_flashinfer_sm(sm))
-        .max_by_key(|sm| {
-            sm.chars()
-                .take_while(char::is_ascii_digit)
-                .collect::<String>()
-                .parse::<u32>()
-                .unwrap_or(0)
-        })
+        .max_by_key(|sm| sm_numeric_prefix(sm).unwrap_or(0))
     {
         args.push("-gencode".to_string());
         args.push(format!("arch=compute_{max_sm},code=compute_{max_sm}"));
@@ -669,7 +695,7 @@ fn flashinfer_includes_from_include(include: PathBuf) -> FlashInferIncludes {
 fn triton_target(sm_targets: &[String]) -> String {
     let max_sm = sm_targets
         .iter()
-        .filter_map(|sm| sm.parse::<u32>().ok())
+        .filter_map(|sm| sm_numeric_prefix(sm))
         .max()
         .expect("expected at least one CUDA SM target for Triton AOT");
 
@@ -680,6 +706,18 @@ fn triton_target(sm_targets: &[String]) -> String {
     }
 
     format!("cuda:{max_sm}:32")
+}
+
+fn sm_numeric_prefix(sm: &str) -> Option<u32> {
+    let digits = sm
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse::<u32>().ok()
+    }
 }
 
 fn generate_triton_artifacts(
@@ -1000,7 +1038,8 @@ fn main() {
     let cuda_include = Path::new(&cuda_path).join("include");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let sm_targets = detect_sm_targets();
-    let arch_args = nvcc_arch_args(&sm_targets);
+    let nvcc_sm_targets = normalize_nvcc_sms(&sm_targets, &nvcc);
+    let arch_args = nvcc_arch_args(&nvcc_sm_targets);
     let deepseek_enabled = cfg!(feature = "deepseek-v4");
     let cutedsl_enabled = cfg!(feature = "deepseek-v4");
     let tilelang_artifacts = if deepseek_enabled {
@@ -1014,8 +1053,16 @@ fn main() {
         None
     };
     println!(
-        "cargo:warning=Compiling CUDA kernels for targets: {}",
+        "cargo:warning=Detected CUDA SM targets: {}",
         sm_targets
+            .iter()
+            .map(|sm| format!("sm_{sm}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    println!(
+        "cargo:warning=Compiling CUDA kernels for nvcc targets: {}",
+        nvcc_sm_targets
             .iter()
             .map(|sm| format!("sm_{sm}"))
             .collect::<Vec<_>>()

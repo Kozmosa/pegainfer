@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use anyhow::Context;
 use clap::Parser;
 use log::info;
 use pegainfer::logging;
@@ -43,19 +44,28 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let model_path = args
-        .model_path
-        .to_str()
-        .expect("Model path must be valid UTF-8");
-    let model_type = detect_model_type(model_path).expect("Failed to detect model type");
+    let model_type = detect_model_type(&args.model_path).with_context(|| {
+        format!(
+            "failed to detect model type from {}",
+            args.model_path.display()
+        )
+    })?;
+    let effective_cuda_graph = match model_type {
+        #[cfg(feature = "deepseek-v2-lite")]
+        ModelType::DeepSeekV2Lite => false,
+        #[cfg(feature = "deepseek-v4")]
+        ModelType::DeepSeekV4 => false,
+        ModelType::Qwen3 | ModelType::Qwen35 => args.cuda_graph,
+    };
 
     info!("=== Rust LLM Server - {} (GPU) ===", model_type);
     info!("Loading engine...");
     let start = Instant::now();
     info!(
-        "Runtime options: model_path={}, cuda_graph={}, device_ordinal={}, tp_size={}",
+        "Runtime options: model_path={}, requested_cuda_graph={}, effective_cuda_graph={}, device_ordinal={}, tp_size={}",
         args.model_path.display(),
         args.cuda_graph,
+        effective_cuda_graph,
         args.device_ordinal,
         args.tp_size
     );
@@ -72,7 +82,23 @@ async fn main() -> anyhow::Result<()> {
                     seed: 42,
                 },
             )
-            .expect("Failed to start DeepSeek V4 engine");
+            .context("failed to start DeepSeek V4 engine")?;
+
+            info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
+
+            handle
+        }
+        #[cfg(feature = "deepseek-v2-lite")]
+        ModelType::DeepSeekV2Lite => {
+            let handle = pegainfer_deepseek_v2_lite::start_engine(
+                &args.model_path,
+                EngineLoadOptions {
+                    enable_cuda_graph: false,
+                    enable_prefill_profile: false,
+                    device_ordinals: vec![0, 1],
+                    seed: 42,
+                },
+            )?;
 
             info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
 
@@ -93,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
                     seed: 42,
                 },
             )
-            .expect("Failed to start Qwen3 engine");
+            .context("failed to start Qwen3 engine")?;
 
             info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
 
@@ -109,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
                     seed: 42,
                 },
             )
-            .expect("Failed to start Qwen3.5 engine");
+            .context("failed to start Qwen3.5 engine")?;
 
             info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
 
@@ -124,7 +150,7 @@ async fn main() -> anyhow::Result<()> {
         pegainfer::vllm_frontend::shutdown_token_from_ctrl_c(),
     )
     .await
-    .expect("vLLM frontend server failed");
+    .context("vLLM frontend server failed")?;
 
     Ok(())
 }

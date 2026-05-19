@@ -441,11 +441,11 @@ fn aggregate_tok_s(tokens: usize, total: Duration) -> Option<f64> {
 }
 
 fn generated_token_hash(tokens: &[u32]) -> String {
-    let mut hash = 0xcbf29ce484222325u64;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for token in tokens {
         for byte in token.to_le_bytes() {
             hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x100000001b3);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
         }
     }
     format!("{hash:016x}")
@@ -928,8 +928,7 @@ impl BenchModel for SchedulerBenchModel {
                             break;
                         }
                     }
-                    Some(TokenEvent::PromptTokens { .. }) => {}
-                    Some(TokenEvent::Scheduled { .. }) => {}
+                    Some(TokenEvent::PromptTokens { .. } | TokenEvent::Scheduled { .. }) => {}
                     Some(TokenEvent::Finished { .. }) => break,
                     Some(TokenEvent::Error { message, .. }) => {
                         anyhow::bail!("scheduler request failed: {message}");
@@ -1052,12 +1051,18 @@ fn build_request_iterations(timings: &[GenTimings]) -> Vec<RequestIterationTimin
         .collect()
 }
 
-fn run_info(cli: &Cli, command: &'static str, model_type: ModelType, load_ms: f64) -> RunInfo {
+fn run_info(
+    cli: &Cli,
+    command: &'static str,
+    model_type: ModelType,
+    load_ms: f64,
+    cuda_graph: bool,
+) -> RunInfo {
     RunInfo {
         command,
         model_path: cli.model_path.clone(),
         model_type: format!("{model_type:?}"),
-        cuda_graph: cli.cuda_graph,
+        cuda_graph,
         load_ms,
         label: cli.label.clone(),
     }
@@ -1069,6 +1074,7 @@ fn bench_request(
     cli: &Cli,
     model_type: ModelType,
     load_ms: f64,
+    cuda_graph: bool,
     args: &RequestArgs,
 ) -> Result<BenchReport> {
     let prompt = resolve_prompt_input(
@@ -1087,7 +1093,7 @@ fn bench_request(
     );
     let timings = measure_timings(model, &prompt.tokens, args.output_len, &args.run)?;
     Ok(BenchReport::Request(Box::new(RequestReport {
-        run: run_info(cli, "request", model_type, load_ms),
+        run: run_info(cli, "request", model_type, load_ms, cuda_graph),
         workload: RequestWorkload {
             prompt: prompt.descriptor,
             output_len: args.output_len,
@@ -1105,6 +1111,7 @@ fn bench_matrix(
     cli: &Cli,
     model_type: ModelType,
     load_ms: f64,
+    cuda_graph: bool,
     args: &MatrixArgs,
 ) -> Result<BenchReport> {
     validate_run_args(&args.run)?;
@@ -1140,7 +1147,7 @@ fn bench_matrix(
     }
 
     Ok(BenchReport::Matrix(MatrixReport {
-        run: run_info(cli, "matrix", model_type, load_ms),
+        run: run_info(cli, "matrix", model_type, load_ms, cuda_graph),
         workload: MatrixWorkload {
             prompt_lens,
             output_lens,
@@ -1159,6 +1166,7 @@ fn bench_curve(
     cli: &Cli,
     model_type: ModelType,
     load_ms: f64,
+    cuda_graph: bool,
     args: &CurveArgs,
 ) -> Result<BenchReport> {
     ensure!(args.window > 0, "--window must be > 0");
@@ -1212,7 +1220,7 @@ fn bench_curve(
     }
 
     Ok(BenchReport::Curve(CurveReport {
-        run: run_info(cli, "curve", model_type, load_ms),
+        run: run_info(cli, "curve", model_type, load_ms, cuda_graph),
         workload: CurveWorkload {
             prompt: prompt.descriptor,
             output_len: args.output_len,
@@ -1297,13 +1305,18 @@ fn run_command(
     cli: &Cli,
     model_type: ModelType,
     load_ms: f64,
+    cuda_graph: bool,
     model: &mut dyn BenchModel,
     tokenizer: &DynTokenizer,
 ) -> Result<BenchReport> {
     match &cli.command {
-        Command::Request(args) => bench_request(model, tokenizer, cli, model_type, load_ms, args),
-        Command::Matrix(args) => bench_matrix(model, cli, model_type, load_ms, args),
-        Command::Curve(args) => bench_curve(model, tokenizer, cli, model_type, load_ms, args),
+        Command::Request(args) => {
+            bench_request(model, tokenizer, cli, model_type, load_ms, cuda_graph, args)
+        }
+        Command::Matrix(args) => bench_matrix(model, cli, model_type, load_ms, cuda_graph, args),
+        Command::Curve(args) => {
+            bench_curve(model, tokenizer, cli, model_type, load_ms, cuda_graph, args)
+        }
         Command::Snapshot(_) | Command::Compare(_) => unreachable!(),
     }
 }
@@ -1524,7 +1537,6 @@ fn run_compare(args: &CompareArgs) -> Result<()> {
         baseline.decode_heavy.prompt_len,
         baseline.decode_heavy.output_len,
     );
-
     println!("{}", render_comparison(&current, &baseline, &args.baseline));
     Ok(())
 }
@@ -1640,13 +1652,14 @@ fn dispatch(
     cli: &Cli,
     model_type: ModelType,
     load_ms: f64,
+    cuda_graph: bool,
     model: &mut dyn BenchModel,
     tokenizer: &DynTokenizer,
 ) -> Result<()> {
     if let Command::Snapshot(args) = &cli.command {
         run_snapshot(model, cli, model_type, args)
     } else {
-        let report = run_command(cli, model_type, load_ms, model, tokenizer)?;
+        let report = run_command(cli, model_type, load_ms, cuda_graph, model, tokenizer)?;
         emit_report(cli, &report)
     }
 }
@@ -1674,11 +1687,28 @@ fn main() -> Result<()> {
         cli.cuda_graph,
         cli.format
     );
-    let model_type = detect_model_type(&cli.model_path)?;
+    let model_type = detect_model_type(&cli.model_path)
+        .with_context(|| format!("failed to detect model type from {}", cli.model_path))?;
     debug!("Detected model type: {:?}", model_type);
     let load_start = Instant::now();
 
     match model_type {
+        #[cfg(feature = "deepseek-v2-lite")]
+        ModelType::DeepSeekV2Lite => {
+            let handle = pegainfer_deepseek_v2_lite::start_engine(
+                Path::new(&cli.model_path),
+                EngineLoadOptions {
+                    enable_cuda_graph: false,
+                    enable_prefill_profile: false,
+                    device_ordinals: vec![0, 1],
+                    seed: command_seed(&cli),
+                },
+            )?;
+            let tokenizer = load_vllm_tokenizer(&cli.model_path)?;
+            let load_ms = dur_ms(load_start.elapsed());
+            let mut bench = SchedulerBenchModel { handle };
+            dispatch(&cli, model_type, load_ms, false, &mut bench, &tokenizer)
+        }
         #[cfg(feature = "deepseek-v4")]
         ModelType::DeepSeekV4 => {
             let handle = pegainfer_deepseek_v4::start_engine(
@@ -1693,7 +1723,7 @@ fn main() -> Result<()> {
             let tokenizer = load_vllm_tokenizer(&cli.model_path)?;
             let load_ms = dur_ms(load_start.elapsed());
             let mut bench = SchedulerBenchModel { handle };
-            dispatch(&cli, model_type, load_ms, &mut bench, &tokenizer)
+            dispatch(&cli, model_type, load_ms, false, &mut bench, &tokenizer)
         }
         ModelType::Qwen3 => {
             let handle = pegainfer_qwen3_4b::start_engine(
@@ -1708,7 +1738,14 @@ fn main() -> Result<()> {
             let tokenizer = load_vllm_tokenizer(&cli.model_path)?;
             let load_ms = dur_ms(load_start.elapsed());
             let mut bench = SchedulerBenchModel { handle };
-            dispatch(&cli, model_type, load_ms, &mut bench, &tokenizer)
+            dispatch(
+                &cli,
+                model_type,
+                load_ms,
+                cli.cuda_graph,
+                &mut bench,
+                &tokenizer,
+            )
         }
         ModelType::Qwen35 => {
             let handle = pegainfer_qwen35_4b::start_engine_with_capacity(
@@ -1724,7 +1761,14 @@ fn main() -> Result<()> {
             let tokenizer = load_vllm_tokenizer(&cli.model_path)?;
             let load_ms = dur_ms(load_start.elapsed());
             let mut bench = SchedulerBenchModel { handle };
-            dispatch(&cli, model_type, load_ms, &mut bench, &tokenizer)
+            dispatch(
+                &cli,
+                model_type,
+                load_ms,
+                cli.cuda_graph,
+                &mut bench,
+                &tokenizer,
+            )
         }
     }
 }

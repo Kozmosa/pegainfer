@@ -3566,6 +3566,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "pegainfer-deepseek-v2-lite"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cudarc",
+ "half",
+ "hex",
+ "memmap2",
+ "pegainfer-core",
+ "pegainfer-engine",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "vllm-text",
+]
+
+[[package]]
 name = "pegainfer-deepseek-v4"
 version = "0.1.0"
 dependencies = [
@@ -3665,6 +3684,7 @@ dependencies = [
  "log",
  "logforth",
  "pegainfer-core",
+ "pegainfer-deepseek-v2-lite",
  "pegainfer-deepseek-v4",
  "pegainfer-qwen3-4b",
  "pegainfer-qwen35-4b",
