@@ -14,6 +14,8 @@ const EXPECTED_OUTPUT_TOKEN_SHA256: &str =
     "f39e57d9b3eb949057ada9b3bc92f7f7037dfd19658dbe3ce145d8fad03ded5e";
 const EXPECTED_OUTPUT_TEXT_SHA256: &str =
     "a521f6dc9739b4506a46822da7c239ac558a879d571f54a064a4a2fbc3a097b7";
+const DSV2_LITE_HIDDEN_SIZE: usize = 2048;
+const DSV2_LITE_MOE_LAYERS: usize = 26;
 
 #[test]
 fn test_deepseek_v2_lite_ep2_rust_generation() -> Result<()> {
@@ -102,13 +104,73 @@ fn run_rust_generation(model_path: &Path) -> Result<()> {
         EXPECTED_OUTPUT_TOKEN_SHA256
     );
     ensure!(
-        result.stats.host_dispatch_remote_routes > 0,
-        "real EP gate did not exercise any remote routed expert"
+        result.stats.ep_backend == current_backend(),
+        "DeepSeek-V2-Lite E2E backend mismatch: got {}, expected {}",
+        result.stats.ep_backend,
+        current_backend()
     );
-    ensure!(
-        result.stats.host_dispatch_local_routes > 0,
-        "real EP gate did not exercise any local routed expert"
-    );
+    match result.stats.ep_backend.as_str() {
+        "host-staged" => {
+            ensure!(
+                result.stats.host_dispatch_remote_routes > 0,
+                "host-staged EP gate did not exercise any remote routed expert"
+            );
+            ensure!(
+                result.stats.host_dispatch_local_routes > 0,
+                "host-staged EP gate did not exercise any local routed expert"
+            );
+            ensure!(
+                result.stats.nccl_dense_exchange_calls == 0
+                    && result.stats.nccl_combine_calls == 0
+                    && result.stats.nccl_dense_exchange_elements == 0
+                    && result.stats.nccl_combine_elements == 0,
+                "host-staged EP gate unexpectedly recorded NCCL collectives"
+            );
+        }
+        "nccl" => {
+            ensure!(
+                result.stats.nccl_dispatch_remote_routes > 0,
+                "NCCL EP gate did not exercise any remote routed expert"
+            );
+            ensure!(
+                result.stats.nccl_dispatch_local_routes > 0,
+                "NCCL EP gate did not exercise any local routed expert"
+            );
+            ensure!(
+                result.stats.nccl_combine_routes
+                    == result.stats.nccl_dispatch_local_routes
+                        + result.stats.nccl_dispatch_remote_routes,
+                "NCCL combine route accounting drift"
+            );
+            let expected_moe_calls = result.stats.generated_tokens * DSV2_LITE_MOE_LAYERS;
+            let expected_collective_elements = expected_moe_calls * DSV2_LITE_HIDDEN_SIZE;
+            ensure!(
+                result.stats.nccl_dense_exchange_calls == expected_moe_calls,
+                "NCCL dense hidden exchange call count drift: got {}, expected {}",
+                result.stats.nccl_dense_exchange_calls,
+                expected_moe_calls
+            );
+            ensure!(
+                result.stats.nccl_combine_calls == expected_moe_calls,
+                "NCCL combine call count drift: got {}, expected {}",
+                result.stats.nccl_combine_calls,
+                expected_moe_calls
+            );
+            ensure!(
+                result.stats.nccl_dense_exchange_elements == expected_collective_elements,
+                "NCCL dense hidden exchange element count drift: got {}, expected {}",
+                result.stats.nccl_dense_exchange_elements,
+                expected_collective_elements
+            );
+            ensure!(
+                result.stats.nccl_combine_elements == expected_collective_elements,
+                "NCCL combine element count drift: got {}, expected {}",
+                result.stats.nccl_combine_elements,
+                expected_collective_elements
+            );
+        }
+        other => anyhow::bail!("unexpected DeepSeek-V2-Lite EP backend in E2E: {other}"),
+    }
 
     let output_text = tokenizer
         .decode(&result.tokens, false)
@@ -126,6 +188,7 @@ fn run_rust_generation(model_path: &Path) -> Result<()> {
         "model_path": model_path,
         "gpu_count": 2,
         "ep_size": result.stats.ep_size,
+        "ep_backend": result.stats.ep_backend,
         "devices": result.stats.device_ordinals,
         "prompt": prompt,
         "prompt_tokens": result.stats.prompt_tokens,
@@ -134,8 +197,19 @@ fn run_rust_generation(model_path: &Path) -> Result<()> {
         "output_text_sha256": output_text_sha256,
         "host_dispatch_local_routes": result.stats.host_dispatch_local_routes,
         "host_dispatch_remote_routes": result.stats.host_dispatch_remote_routes,
+        "nccl_dispatch_local_routes": result.stats.nccl_dispatch_local_routes,
+        "nccl_dispatch_remote_routes": result.stats.nccl_dispatch_remote_routes,
+        "nccl_combine_routes": result.stats.nccl_combine_routes,
+        "nccl_dense_exchange_calls": result.stats.nccl_dense_exchange_calls,
+        "nccl_combine_calls": result.stats.nccl_combine_calls,
+        "nccl_dense_exchange_elements": result.stats.nccl_dense_exchange_elements,
+        "nccl_combine_elements": result.stats.nccl_combine_elements,
         "output_text": output_text,
     });
     println!("{}", serde_json::to_string_pretty(&payload)?);
     Ok(())
+}
+
+fn current_backend() -> String {
+    env::var("PEGAINFER_DSV2_LITE_EP_BACKEND").unwrap_or_else(|_| "host-staged".to_string())
 }

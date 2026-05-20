@@ -16,7 +16,7 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
     let mut generator = DeepSeekV2LiteEp2Generator::load(model_path, options)?;
     let (submit_tx, mut submit_rx) = mpsc::unbounded_channel();
 
-    std::thread::Builder::new()
+    let join_handle = std::thread::Builder::new()
         .name("deepseek-v2-lite-ep2".to_string())
         .spawn(move || {
             while let Some(req) = submit_rx.blocking_recv() {
@@ -25,7 +25,7 @@ pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Res
         })
         .context("spawn DeepSeek-V2-Lite EP=2 engine thread")?;
 
-    Ok(EngineHandle::new(submit_tx))
+    Ok(EngineHandle::new_with_join_handle(submit_tx, join_handle))
 }
 
 fn handle_request(generator: &mut DeepSeekV2LiteEp2Generator, req: &GenerateRequest) {

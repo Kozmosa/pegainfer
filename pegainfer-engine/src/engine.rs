@@ -1,4 +1,8 @@
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    thread::{self, JoinHandle},
+};
 
 use tokio::sync::mpsc;
 
@@ -88,18 +92,90 @@ pub enum TokenEvent {
 
 #[derive(Clone)]
 pub struct EngineHandle {
-    submit_tx: mpsc::UnboundedSender<GenerateRequest>,
+    inner: Arc<EngineInner>,
+}
+
+struct EngineInner {
+    submit_tx: Option<mpsc::UnboundedSender<GenerateRequest>>,
+    join_handle: Option<JoinHandle<()>>,
 }
 
 impl EngineHandle {
     pub fn new(submit_tx: mpsc::UnboundedSender<GenerateRequest>) -> Self {
-        Self { submit_tx }
+        Self::from_parts(submit_tx, None)
+    }
+
+    /// Construct a handle that owns the engine thread shutdown.
+    ///
+    /// Dropping the last handle clone closes the submit channel and then waits
+    /// for the thread to return. That final drop may block until in-flight
+    /// generation and backend teardown finish.
+    pub fn new_with_join_handle(
+        submit_tx: mpsc::UnboundedSender<GenerateRequest>,
+        join_handle: JoinHandle<()>,
+    ) -> Self {
+        Self::from_parts(submit_tx, Some(join_handle))
+    }
+
+    fn from_parts(
+        submit_tx: mpsc::UnboundedSender<GenerateRequest>,
+        join_handle: Option<JoinHandle<()>>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(EngineInner {
+                submit_tx: Some(submit_tx),
+                join_handle,
+            }),
+        }
     }
 
     pub fn submit(
         &self,
         req: GenerateRequest,
     ) -> std::result::Result<(), mpsc::error::SendError<GenerateRequest>> {
-        self.submit_tx.send(req)
+        match self.inner.submit_tx.as_ref() {
+            Some(submit_tx) => submit_tx.send(req),
+            None => Err(mpsc::error::SendError(req)),
+        }
+    }
+}
+
+impl Drop for EngineInner {
+    fn drop(&mut self) {
+        let _ = self.submit_tx.take();
+        if let Some(join_handle) = self.join_handle.take() {
+            if join_handle.thread().id() != thread::current().id() {
+                let _ = join_handle.join();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use super::*;
+
+    #[test]
+    fn joins_owned_thread_after_last_handle_drop() {
+        let (submit_tx, mut submit_rx) = mpsc::unbounded_channel::<GenerateRequest>();
+        let exited = Arc::new(AtomicBool::new(false));
+        let thread_exited = Arc::clone(&exited);
+        let join_handle = thread::spawn(move || {
+            while submit_rx.blocking_recv().is_some() {}
+            thread_exited.store(true, Ordering::SeqCst);
+        });
+        let handle = EngineHandle::new_with_join_handle(submit_tx, join_handle);
+        let clone = handle.clone();
+
+        drop(handle);
+        assert!(!exited.load(Ordering::SeqCst));
+
+        drop(clone);
+        assert!(exited.load(Ordering::SeqCst));
     }
 }
