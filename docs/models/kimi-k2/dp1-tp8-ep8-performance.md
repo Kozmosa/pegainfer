@@ -62,9 +62,14 @@ This is a discipline, not a rigid template. The important part is that future
 readers can reconstruct why an optimization was attempted, what it was expected
 to buy, and which evidence made it worth keeping.
 
-## Baseline Commands
+## Canonical Bs64 Pressure Test
 
-PegaInfer server shape for this project:
+Use this exact service pressure-test shape for bs64 comparisons. Do not change
+prompt/output length, request count, request rate, concurrency, percentiles,
+streaming mode, or `ignore-eos` when reporting numbers against the vLLM bs64
+baseline.
+
+Server:
 
 ```bash
 cd /root/develop/xingming/pegainfer
@@ -80,9 +85,13 @@ cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep -- \
   --cuda-graph true
 ```
 
-Service benchmark:
+Client:
 
 ```bash
+cd /root/develop/xingming/pegainfer
+COMMIT=$(git rev-parse --short HEAD)
+mkdir -p /tmp/kimi-bs64-baseline
+source /root/develop/xingming/vllm_test/.venv/bin/activate
 vllm bench serve \
   --backend openai \
   --model /data/models/Kimi-K2.5 \
@@ -96,12 +105,34 @@ vllm bench serve \
   --random-range-ratio 0 \
   --num-prompts 256 \
   --max-concurrency 64 \
+  --request-rate inf \
   --ignore-eos \
   --percentile-metrics ttft,tpot,itl \
-  --metric-percentiles 50,95,99
+  --metric-percentiles 50,95,99 \
+  --save-result \
+  --save-detailed \
+  --result-dir /tmp/kimi-bs64-baseline \
+  --result-filename pegainfer_tp8_pplx_bs64_${COMMIT}.json \
+  2>&1 | tee /tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_${COMMIT}.log
 ```
 
-Correctness probe:
+Required report fields:
+
+| Field | Value |
+| --- | --- |
+| `--random-input-len` | `1` |
+| `--random-output-len` | `128` |
+| `--random-range-ratio` | `0` |
+| `--num-prompts` | `256` |
+| `--max-concurrency` | `64` |
+| `--request-rate` | `inf` |
+| `--ignore-eos` | enabled |
+| `--percentile-metrics` | `ttft,tpot,itl` |
+| `--metric-percentiles` | `50,95,99` |
+
+## Correctness Probe
+
+Run this before accepting a performance change:
 
 ```bash
 cd /root/develop/xingming/pegainfer
