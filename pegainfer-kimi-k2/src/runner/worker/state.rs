@@ -73,17 +73,8 @@ impl KimiRankThreadState {
                         self.sliced_load_plan.rank
                     )
                 })?;
-        let decode_arenas = KimiWorkerDecodeArenas::new(
-            &self.ctx.as_device_context(),
-            one_token_cache.vocab_rows,
-            &self.local_dims,
-        )
-        .with_context(|| {
-            format!(
-                "failed to allocate Kimi rank {} decode arenas",
-                self.sliced_load_plan.rank
-            )
-        })?;
+        let decode_arenas =
+            KimiWorkerDecodeArenas::new(one_token_cache.vocab_rows, &self.local_dims);
         let report = KimiRankWeightLoadReport::from_loaded_weights(
             tensor_count,
             total_bytes,
@@ -122,6 +113,18 @@ impl KimiRankThreadState {
         self.forward_prompt_next_token_inner(slot, decode_batch_size, input_ids, ep_max_seq_len)
     }
 
+    pub(super) fn ensure_decode_arena(&mut self, decode_batch_size: usize) -> Result<()> {
+        self.ctx.set_current()?;
+        let loaded = self.loaded.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("Kimi rank weights must be loaded before decode arena allocation")
+        })?;
+        let device_ctx = self.ctx.as_device_context();
+        let _ = loaded
+            .decode_arenas
+            .get_mut(&device_ctx, decode_batch_size)?;
+        Ok(())
+    }
+
     pub(super) fn forward_decode_batch_next_tokens(
         &mut self,
         token_ids: &[u32],
@@ -156,20 +159,6 @@ impl KimiRankThreadState {
         } = loaded;
         let rank = gpu.rank;
         let active_len = token_ids.len();
-        #[cfg(feature = "kernel-call-trace")]
-        if rank == 0 && call_trace::is_enabled() {
-            let kv_len = append_positions
-                .iter()
-                .copied()
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1);
-            for call in
-                crate::batch_decode_trace::trace_decode_kernel_calls("", decode_batch_size, kv_len)?
-            {
-                call_trace::record_call(call);
-            }
-        }
         ensure!(
             (1..=KIMI_DECODE_MAX_BATCH).contains(&decode_batch_size),
             "Kimi decode batch size {decode_batch_size} must be in 1..={KIMI_DECODE_MAX_BATCH}"
@@ -178,7 +167,23 @@ impl KimiRankThreadState {
             active_len <= decode_batch_size,
             "Kimi active decode rows {active_len} exceed decode batch size {decode_batch_size}"
         );
-        let decode_arena = decode_arenas.get_mut(decode_batch_size)?;
+        let decode_arena = decode_arenas.get_mut(&device_ctx, decode_batch_size)?;
+        #[cfg(feature = "kernel-call-trace")]
+        if rank == 0 && call_trace::is_enabled() {
+            let kv_len = append_positions
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+            for call in crate::batch_decode_trace::trace_decode_kernel_calls(
+                "",
+                decode_arena.batch_size,
+                kv_len,
+            )? {
+                call_trace::record_call(call);
+            }
+        }
         decode_arena
             .configure_batch_decode(&device_ctx, slots, append_positions)
             .with_context(|| format!("Kimi rank {rank} configure batch decode KV page table"))?;
@@ -284,7 +289,7 @@ impl KimiRankThreadState {
         let input_token_id = *input_ids
             .last()
             .ok_or_else(|| anyhow::anyhow!("Kimi prompt ids unexpectedly empty"))?;
-        let decode_arena = decode_arenas.get_mut(decode_batch_size)?;
+        let decode_arena = decode_arenas.get_mut(&device_ctx, decode_batch_size)?;
         decode_arena
             .configure_slot_prefill(&device_ctx, slot, seq_len)
             .with_context(|| {

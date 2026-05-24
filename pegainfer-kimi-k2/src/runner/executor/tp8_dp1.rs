@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::{
     config::{KIMI_K2_DENSE_LAYERS, KIMI_K2_LAYERS, KIMI_K2_MOE_LAYERS, KIMI_K2_VOCAB},
@@ -143,6 +143,28 @@ impl ForwardExecutor for Tp8Dp1ForwardExecutor {
             .iter()
             .filter(|r| r.loaded_to_gpu && r.typed_view_validated)
             .count()
+    }
+}
+
+impl Tp8Dp1ForwardExecutor {
+    pub(in crate::runner) fn ensure_decode_batch(&self, decode_batch_size: usize) -> Result<()> {
+        if self.workers.is_empty() {
+            bail!("Kimi TP8 executor has no rank workers");
+        }
+        let responses = self
+            .workers
+            .iter()
+            .map(|worker| worker.ensure_decode_arena_async(decode_batch_size))
+            .collect::<Result<Vec<_>>>()?;
+        for (rank, response) in responses.into_iter().enumerate() {
+            response
+                .recv()
+                .map_err(|_| anyhow::anyhow!("Kimi-K2 rank {rank} dropped arena response"))?
+                .with_context(|| {
+                    format!("Kimi-K2 rank {rank} decode arena bs{decode_batch_size}")
+                })?;
+        }
+        Ok(())
     }
 }
 

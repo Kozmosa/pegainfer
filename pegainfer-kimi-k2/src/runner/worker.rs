@@ -56,7 +56,8 @@ use crate::{
 pub(super) use crate::typed_scratch::{KimiWorkerDecodeScratch, MARLIN_W13_OUT_DIM};
 
 const KIMI_MARLIN_MAX_BLOCK_SIZE: usize = 64;
-const KIMI_DECODE_MAX_BATCH: usize = 4;
+const KIMI_DECODE_MAX_BATCH: usize = 64;
+const KIMI_DECODE_BATCH_BUCKETS: [usize; 7] = [1, 2, 4, 8, 16, 32, KIMI_DECODE_MAX_BATCH];
 const KIMI_DECODE_PAGE_SIZE: usize = 16;
 const KIMI_DECODE_PAGES_PER_REQUEST: usize = 128;
 const KIMI_DECODE_ROPE_CACHE_TOKENS: usize = KIMI_DECODE_PAGE_SIZE * KIMI_DECODE_PAGES_PER_REQUEST;
@@ -111,6 +112,10 @@ enum KimiRankCommand {
     InitTpComm {
         id: Id,
         world_size: usize,
+        resp: SyncSender<Result<()>>,
+    },
+    EnsureDecodeArena {
+        decode_batch_size: usize,
         resp: SyncSender<Result<()>>,
     },
     ForwardPromptNextToken {
@@ -257,6 +262,20 @@ impl KimiRankWorker {
         Ok(resp_rx)
     }
 
+    pub(super) fn ensure_decode_arena_async(
+        &self,
+        decode_batch_size: usize,
+    ) -> Result<Receiver<Result<()>>> {
+        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(KimiRankCommand::EnsureDecodeArena {
+                decode_batch_size,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("Kimi-K2 rank worker channel closed"))?;
+        Ok(resp_rx)
+    }
+
     pub(super) fn forward_prompt_next_token_async(
         &self,
         input_ids: Vec<u32>,
@@ -371,39 +390,69 @@ struct KimiRankLoadedWeights {
 }
 
 struct KimiWorkerDecodeArenas {
-    arenas: Vec<KimiWorkerDecodeArena>,
+    arenas: Vec<Option<KimiWorkerDecodeArena>>,
+    vocab_rows: usize,
+    dims: crate::config::KimiLocalDims,
 }
 
 impl KimiWorkerDecodeArenas {
-    fn new(
-        ctx: &DeviceContext,
-        vocab_rows: usize,
-        dims: &crate::config::KimiLocalDims,
-    ) -> Result<Self> {
-        let mut arenas = Vec::with_capacity(KIMI_DECODE_MAX_BATCH);
-        for batch_size in 1..=KIMI_DECODE_MAX_BATCH {
-            arenas.push(
-                KimiWorkerDecodeArena::new(
-                    ctx,
-                    KIMI_K2_LAYERS,
-                    batch_size,
-                    KIMI_DECODE_PAGE_SIZE,
-                    vocab_rows,
-                    dims,
-                )
-                .with_context(|| format!("failed to allocate Kimi bs{batch_size} decode arena"))?,
-            );
+    fn new(vocab_rows: usize, dims: &crate::config::KimiLocalDims) -> Self {
+        let arenas = KIMI_DECODE_BATCH_BUCKETS.iter().map(|_| None).collect();
+        Self {
+            arenas,
+            vocab_rows,
+            dims: *dims,
         }
-        Ok(Self { arenas })
     }
 
-    fn get_mut(&mut self, decode_batch_size: usize) -> Result<&mut KimiWorkerDecodeArena> {
+    fn get_mut(
+        &mut self,
+        ctx: &DeviceContext,
+        decode_batch_size: usize,
+    ) -> Result<&mut KimiWorkerDecodeArena> {
         ensure!(
             (1..=KIMI_DECODE_MAX_BATCH).contains(&decode_batch_size),
             "Kimi decode batch size {decode_batch_size} must be in 1..={KIMI_DECODE_MAX_BATCH}"
         );
-        Ok(&mut self.arenas[decode_batch_size - 1])
+        let (idx, arena_batch_size) = decode_batch_bucket(decode_batch_size)?;
+        if self.arenas[idx].is_none() {
+            self.arenas[idx] = Some(
+                KimiWorkerDecodeArena::new(
+                    ctx,
+                    KIMI_K2_LAYERS,
+                    arena_batch_size,
+                    KIMI_DECODE_PAGE_SIZE,
+                    self.vocab_rows,
+                    &self.dims,
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to allocate Kimi bs{arena_batch_size} decode arena for requested bs{decode_batch_size}"
+                    )
+                })?,
+            );
+        }
+        self.arenas[idx]
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Kimi bs{arena_batch_size} decode arena missing"))
     }
+}
+
+fn decode_batch_bucket(decode_batch_size: usize) -> Result<(usize, usize)> {
+    ensure!(
+        (1..=KIMI_DECODE_MAX_BATCH).contains(&decode_batch_size),
+        "Kimi decode batch size {decode_batch_size} must be in 1..={KIMI_DECODE_MAX_BATCH}"
+    );
+    KIMI_DECODE_BATCH_BUCKETS
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, bucket)| decode_batch_size <= *bucket)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Kimi decode batch size {decode_batch_size} has no arena bucket up to {KIMI_DECODE_MAX_BATCH}"
+            )
+        })
 }
 
 struct KimiOneTokenForwardCache {
@@ -543,6 +592,13 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
                 let result = state.init_tp_comm(id, world_size);
                 let _ = resp.send(result);
             }
+            KimiRankCommand::EnsureDecodeArena {
+                decode_batch_size,
+                resp,
+            } => {
+                let result = state.ensure_decode_arena(decode_batch_size);
+                let _ = resp.send(result);
+            }
             KimiRankCommand::ForwardPromptNextToken {
                 slot,
                 decode_batch_size,
@@ -633,6 +689,30 @@ pub(super) fn build_placements(device_ordinals: &[usize]) -> Result<Vec<KimiK2Ra
 #[cfg(test)]
 mod tests {
     use super::cache::build_decode_append_page_metadata;
+    use super::decode_batch_bucket;
+
+    #[test]
+    fn decode_batch_bucket_rounds_up_to_power_of_two_buckets() {
+        let cases = [
+            (1, (0, 1)),
+            (2, (1, 2)),
+            (3, (2, 4)),
+            (4, (2, 4)),
+            (5, (3, 8)),
+            (17, (5, 32)),
+            (33, (6, 64)),
+            (64, (6, 64)),
+        ];
+        for (requested, expected) in cases {
+            assert_eq!(decode_batch_bucket(requested).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn decode_batch_bucket_rejects_out_of_range_sizes() {
+        assert!(decode_batch_bucket(0).is_err());
+        assert!(decode_batch_bucket(65).is_err());
+    }
 
     #[test]
     fn decode_page_metadata_uses_multiple_pages_per_request() {

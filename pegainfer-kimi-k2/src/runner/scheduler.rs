@@ -28,7 +28,7 @@ use crate::{
     weights::{KimiRankGpuContext, KimiRankSlicedLoadPlan, ensure_text_only_model_index},
 };
 
-const KIMI_RUNNER_MAX_BATCH: usize = 4;
+const KIMI_RUNNER_MAX_BATCH: usize = 64;
 
 pub(crate) fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<EngineHandle> {
     let parallel = resolve_parallel_config(&options)?;
@@ -254,6 +254,22 @@ impl KimiK2Scheduler {
 
     fn handle_request_batch(&mut self, reqs: Vec<GenerateRequest>) {
         let decode_batch_size = reqs.len();
+        if let Err(err) = self.runtime.ensure_decode_batch(decode_batch_size) {
+            let message = format!(
+                "Kimi-K2 decode arena allocation failed for batch size {decode_batch_size} after {}/{} ranks loaded: {err:#}",
+                self.runtime.gpu_weight_ready_rank_count(),
+                self.runtime.rank_count()
+            );
+            eprintln!("kimi-k2: {message}");
+            for req in reqs {
+                let _ = req.token_tx.send(TokenEvent::Error {
+                    message: message.clone(),
+                    prompt_tokens: req.prompt_tokens.len(),
+                    completion_tokens: 0,
+                });
+            }
+            return;
+        }
         let mut active = Vec::with_capacity(reqs.len());
         for (slot, req) in reqs.into_iter().enumerate() {
             if let Some(active_req) = self.prefill_request(req, slot, decode_batch_size) {
@@ -465,6 +481,10 @@ impl KimiK2Runtime {
 
     fn gpu_weight_ready_rank_count(&self) -> usize {
         self.executor.gpu_weight_ready_count()
+    }
+
+    fn ensure_decode_batch(&self, decode_batch_size: usize) -> Result<()> {
+        self.executor.ensure_decode_batch(decode_batch_size)
     }
 
     fn forward_prompt_next_token_in_slot(
