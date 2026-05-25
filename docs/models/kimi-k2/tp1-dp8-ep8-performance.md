@@ -263,10 +263,6 @@ cargo test -r -p pegainfer-kimi-k2 --features pplx-ep runner::engine::tests --no
   `64/64` success with `--request-rate 16`, peak concurrent requests `54`, TTFT p50/p99
   `58.10/110.88ms`, TPOT p50/p99 `35.91/37.63ms`. This covers prompt_len1
   admissions landing while existing decode slots are active.
-- Old serial-prefill reference rerun from a detached `8431955` worktree was attempted, but the
-  temporary worktree initially lacked the FlashInfer third-party include tree. After fixing that,
-  the run was stopped because the current task shifted to rechecking vLLM; no serial-reference
-  mismatch claim is made here.
 
 Performance:
 
@@ -282,44 +278,20 @@ Performance:
   `256/256` success, output `594.57 tok/s`, TTFT p50/p99 `161.30/303.20ms`,
   TPOT p50/p95/p99 `107.20/109.00/109.20ms`, ITL p50/p99 `108.92/116.35ms`.
 
-vLLM startup-command audit, h20-100, vLLM `0.19.0`, NCCL path:
+vLLM baseline diagnosis, h20-100, vLLM `0.19.0`, NCCL/AgRs path:
 
-- Original server command used `--max-model-len 4096`; the log confirms
-  `max_seq_len=4096`. `max_model_len` is therefore not the cause of the 100ms-class
-  sustained TPOT. The active context in this benchmark is only about 129 tokens.
-- vLLM workers initialize with `backend=nccl`, `vLLM is using nccl==2.27.5`, and
-  `Using AgRsAll2AllManager all2all manager`. Keep the vLLM baseline on this
-  NCCL/AgRs path.
-- `--all2all-backend pplx` is not a valid baseline knob for this environment. vLLM
-  logs `The 'pplx' all2all backend has been removed. Falling back to
-  'allgather_reducescatter'`.
-- `--enable-dbo` is also not valid while staying on the NCCL/AgRs
-  `allgather_reducescatter` path. vLLM rejects startup with:
-  `Microbatching currently only supports the deepep_low_latency and
-  deepep_high_throughput all2all backend`.
-- Default `api_server_count` becomes `data_parallel_size` (`8`). For one local
-  `vllm bench serve` client, use `--api-server-count 1` to remove HTTP/API-process
-  routing as a variable. This also reduces startup and graph-pool noise when paired
-  with `--max-num-seqs 64`.
-- `--max-num-seqs 64` changes graph capture from largest `512` to largest `128` and
-  graph pool from about `5.3 GiB` to `1.72 GiB`; it does not by itself fix sustained
-  `num_prompts=256` TPOT.
-- Single-wave bs64 after this command audit:
-  `/tmp/kimi-vllm-dp8-cmdcheck-20260525/api1_maxseq64_repeat64_after_256_modelname.json`
-  reports `64/64` success, output `1230.86 tok/s`, TPOT p50/p99
-  `50.45/50.46ms`.
-- Sustained bs64 with four refill waves:
-  `/tmp/kimi-vllm-dp8-cmdcheck-20260525/api1_maxseq64_measure_bs64_o128_after_warmup_modelname.json`
-  reports `256/256` success, output `600.55 tok/s`, TPOT p50/p99
-  `106.92/108.73ms`.
-- The sustained run starts requests in waves around seconds `0`, `12-13`, `26-27`,
-  and `40`. Those refill waves mix prompt_len=1 admission with ongoing decode. That
-  is the main interpretation difference between `50ms` one-shot pure decode and
-  `106ms` sustained service TPOT under the vLLM/NCCL baseline.
+- Startup sanity: `max_seq_len=4096` is confirmed in the log; active context is only
+  about 129 tokens. Workers use `nccl==2.27.5` and `AgRsAll2AllManager`. `pplx` is
+  removed/falls back in this vLLM, and DBO requires DeepEP backends, so neither is a
+  valid NCCL baseline knob here.
+- Command sanity: use `--api-server-count 1`, `--max-num-seqs 64`, and client
+  `--model kimi-k2.5`. This removes API-process routing noise and lowers graph
+  capture from largest `512` to `128`, but does not by itself fix sustained TPOT.
+- Single-wave vs sustained: the same server reports `50.45/50.46ms` TPOT p50/p99
+  for one 64-request wave, but `106.92/108.73ms` for sustained
+  `num_prompts=256,max_concurrency=64`.
 
-vLLM DPLB / CUDA graph bucket audit, same server command:
-
-- Directly pinned DP-rank controls:
+Pinned DP-rank controls explain the cliff:
 
 | Run | DP-rank distribution | Global output | TPOT p50/p99 | Artifact |
 | --- | --- | ---: | ---: | --- |
@@ -327,45 +299,26 @@ vLLM DPLB / CUDA graph bucket audit, same server command:
 | one-rank over bucket | `9,8,8,8,8,8,8,7` | `640.94 tok/s` | `96.01/97.34ms` | `/tmp/kimi-vllm-dp8-dplb-20260525/skew_98888887/` |
 | observed-like skew | `8,9,9,9,8,7,7,7` | `612.12 tok/s` | `99.80/99.99ms` | `/tmp/kimi-vllm-dp8-dplb-20260525/skew_89998777/` |
 
-- The old sustained vLLM log showed the same kind of imbalance at bs64:
-  `8,9,9,9,8,7,7,7`, `11,7,7,7,7,8,9,8`, `6,9,9,9,8,8,8,7`,
-  and `10,9,8,7,7,7,7,9`. That is enough to move at least one rank above 8
-  active requests in every slow wave.
-- vLLM DPLB chooses a DP engine by minimizing `waiting * 4 + running` in
-  `/root/develop/xingming/vllm_test/.venv/lib/python3.10/site-packages/vllm/v1/engine/core_client.py`
-  (`get_core_engine_for_request`, lines `1337-1360`). The local load state is
-  periodically overwritten by coordinator stats (`lines 1263-1274`). Under a bursty
-  refill workload this can produce small `9/7` or `11/6` imbalances even when global
-  concurrency is exactly 64.
-- CUDA graph dispatch pads to the next captured size:
-  `/root/develop/xingming/vllm_test/.venv/lib/python3.10/site-packages/vllm/v1/cudagraph_dispatcher.py`
-  maps non-exact sizes to the next capture bucket (`lines 71-90`), then creates the
-  padded descriptor (`lines 140-151`). With capture sizes `[1,2,4,8,16,...]`,
-  local batch `8` runs bucket 8, while local batch `9` runs bucket 16.
-- DP coordination then pads all ranks to the maximum padded token count when CUDA
-  graph is enabled:
-  `/root/develop/xingming/vllm_test/.venv/lib/python3.10/site-packages/vllm/v1/worker/dp_utils.py`
-  says DP padding is enabled for synced CUDA graph mode (`lines 148-160`) and pads
-  every rank to the max (`lines 78-88`). `gpu_model_runner.py` coordinates across DP
-  and re-dispatches with the DP-padded size (`lines 3616-3637`).
-- Therefore the performance cliff is mechanical: if any DP rank receives 9 requests,
-  vLLM pads that rank from 9 to 16, synchronizes the DP group, and every rank runs the
-  bucket-16 graph. That turns a true `8x8` bs64 wave (`~48-50ms`) into a bucket-16
-  wave (`~96-100ms`) even though total concurrency is still 64.
+Mechanism:
 
-Decision for vLLM interpretation:
+- vLLM DPLB minimizes `waiting * 4 + running`
+  (`vllm/v1/engine/core_client.py:1337-1360`) and refreshes local counts from
+  coordinator stats (`core_client.py:1263-1274`). Sustained refill logs show small
+  imbalances such as `8,9,9,9,8,7,7,7`, `11,7,7,7,7,8,9,8`, and
+  `10,9,8,7,7,7,7,9`.
+- CUDA Graph dispatch pads non-exact sizes to the next captured bucket
+  (`vllm/v1/cudagraph_dispatcher.py:71-90,140-151`), so local batch `8` uses bucket
+  8 and local batch `9` uses bucket 16.
+- DP coordination pads every rank to the maximum padded size when CUDA Graph is
+  active (`vllm/v1/worker/dp_utils.py:78-88,148-160`;
+  `gpu_model_runner.py:3616-3637`). One rank at 9 therefore makes the whole DP group
+  execute bucket 16.
 
-- Yes, the vLLM DPLB behavior is the proximate trigger for the surprising 2x TPOT.
-  More precisely, it is a DPLB plus DP CUDA-graph padding cliff. The model and NCCL
-  path can do bs64 in `~50ms` when rank-local batch is exactly `8x8`; sustained
-  refill becomes `~100ms` because the default DPLB does not preserve the graph-bucket
-  boundary.
-- For external vLLM baseline reporting, keep the out-of-box sustained number
-  (`~106ms`) if comparing real serving behavior. For kernel/runtime capability at
-  bs64, also report a pinned-balanced control (`~48-50ms`) and name it as such.
-- A vLLM-side fix would need bucket-aware DP routing for this workload, for example
-  avoiding `rank_local_active > 8` while the global target is bs64, or using an
-  explicit router/header assignment for controlled benchmarks.
+Decision for vLLM interpretation: the surprising 2x TPOT is a DPLB plus DP CUDA
+Graph padding cliff. Out-of-box sustained serving is correctly reported as
+`~106ms`; balanced pinned capability at bs64 is `~48-50ms`. A vLLM-side fix needs
+bucket-aware DP routing or explicit router/header assignment for controlled bs64
+benchmarks.
 
 Decision:
 
