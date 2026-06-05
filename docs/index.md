@@ -24,6 +24,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
+| `models/qwen3/roadmap.md` | Qwen3-4B roadmap (2026-06 review): line is the maturity bar; open set is #220 RoPE OOB, per-row batch sampling, zero TP coverage, zero-adapter-only LoRA gate, dropped prefix-cache observability, stale docs. Sequenced Now/Next/Later + cleanup ledger. |
 | `models/qwen3/model-crate.md` | `pegainfer-qwen3-4b` owns Qwen3 config/weights/executor/scheduler/tests/kernel plan; root sees generic `EngineHandle`; split-K retuned to `256/64`, with 4k/64 serving TPOT p50 at `6.46ms` on RTX 5090. |
 | `models/qwen3/prefix-cache.md` | Prefix caching on by default for Qwen3-4B: full-block kvbm radix matching at the executor, suffix-only prefill. Repeated ~1900-token prompt TTFT 141.8 → 16.3ms p50 (8.7×); warm TTFT ≈ TPOT + ~5ms setup. Includes the RoPE scalar-path corruption fix and the drain-the-stream TTFT measurement pitfall. |
 | `models/qwen3/accuracy-gate.md` | Qwen3-4B instance of the logits golden gate (`tests/hf_golden_gate.rs`): 48 teacher-forced sequences / 816 positions vs a stored HF bf16 golden, replayed over bs=1 / batched eager / CUDA-graph. Strict guards: regret check + mean ≤ 0.06 + p99 ≤ 0.20; absolute max printed but not asserted (coverage-unstable). Methodology in `subsystems/correctness/`. |
@@ -35,6 +36,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
+| `models/qwen35/roadmap.md` | Qwen3.5-4B roadmap (2026-06 review): fast and decode-correct, but a live long-prompt accuracy failure (GSM8K ~2% vs HF ~79%), no logits gate (#186, blocked on a teacher-forcing executor), ~640MB HND prefill staging + 20k cap, pre-#85 admission semantics. Sequenced Now/Next/Later + cleanup ledger. |
 | `models/qwen35/optimization.md` | Hybrid 24 linear + 8 full attn. At parity with vLLM: TTFT 225ms, TPOT 11.81ms (+1%). Post-accuracy-fix GDR decode kernel restore (#9). |
 | `models/qwen35/accuracy.md` | Qwen3.5-4B HF parity work: major decode-state bugs are fixed, `conv1d` now matches HF's bf16 pre-`SiLU` rounding, exact HF matches improved to 11/13, and only two small-logit-drift cases remain. |
 | `models/qwen35/model-crate.md` | `pegainfer-qwen35-4b` owns Qwen3.5 model/scheduler/recurrent ops/tests/benches; root loads it through `EngineHandle`. Build/check/clippy, root bench sanity check, Qwen3.5 e2e, and scheduler e2e pass. |
@@ -67,6 +69,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
+| `models/kimi-k2/roadmap.md` | Cross-cutting Kimi-K2 plan, verified against code 2026-06: decode beats vLLM (bs64 `1336 vs 594 tok/s`) but serving contract is broken (sampling params silently ignored, no EOS stop, 2048-token arena overrun) and no accuracy gate is clone-reproducible. Sequence: correctness + accuracy-gate-in-git → TTFT/HTTP overhead → batching/prefix-cache and PPLX-throughput chains → cleanup ledger. |
 | `models/kimi-k2/optimization.md` | Kimi-K2 model card + optimization log：61 层 MLA + Marlin WNA16 MoE，H20 ×8 当前 TP8/EP8。重点是 decode：bs4 graph TPOT `14.39ms`（≈`278 tok/s`），目标 `> 300 tok/s`；下一阶段迁到 TP1+DP8+EP8（PPLX）。Prefill 优先级低。 |
 | `models/kimi-k2/support-analysis.md` | Kimi-K2 text-only bring-up：Marlin WNA16 routed expert、MLA prompt、全 61 层 prompt forward、多 prompt vLLM top-20 gate 已过；bs4 wave decode 已接入，Marlin atomic split-K row-state bug 修复后 output16 row diff 清零，正在撤掉 decode 诊断负担并回到 bs4 性能主线。 |
 | `models/kimi-k2/operator-todo.md` | Kimi-K2 算子清单：MLA + Marlin WNA16 routed expert + NCCL RS bridge 主链；CUDA Graph 覆盖整段 decode，synthetic output64 avg `14.39ms` / p99 `14.83ms`；CUTLASS INT4 后端与 decode row-diff 诊断已下线，详见 changelog。 |
